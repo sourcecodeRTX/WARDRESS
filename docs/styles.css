@@ -1,0 +1,26 @@
+/*
+ * Wardress docs — custom styles.
+ * Mintlify auto-loads any .css file in the docs content directory.
+ */
+
+/* Mermaid diagram container — spacious vertical margins, padding, and zero vertical scrollbar artifacts */
+.mermaid,
+[class*="mermaid"] {
+  max-width: 100%;
+  overflow-x: auto !important;
+  overflow-y: hidden !important; /* Eliminates native Windows vertical scrollbar glitch */
+  margin-block: 2.25rem !important;
+  padding: 1.5rem 1.25rem !important;
+}
+
+/* Mermaid SVG vector scaling */
+svg[id^="mermaid-"],
+svg[aria-roledescription],
+.mermaid svg,
+[class*="mermaid"] svg {
+  max-width: 100% !important;
+  height: auto !important;
+  display: block;
+  margin-inline: auto;
+  overflow: visible !important;
+}

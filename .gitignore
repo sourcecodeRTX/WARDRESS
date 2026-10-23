@@ -1,0 +1,55 @@
+# --- Secrets / environment ---
+.env
+*.env.local
+
+# --- Python / uv ---
+__pycache__/
+*.py[cod]
+wardress-test-sites (1).txt
+.venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+WARDRESS_AUDIT_REPORT_2026-07-21.md
+project_structure.txt
+build/
+Audit
+react-bits-main
+.agents
+presentation
+# Build-log litter from failed image builds (scripts/lib.ps1 keeps them in
+# .build-logs/; the root-level patterns are defense-in-depth for older checkouts).
+.build-logs/
+build_*.log
+build_*.err.log
+# Support bundles (diagnostics.ps1 defaults outside the repo; belt-and-braces).
+diagnostics_*.txt
+EXample
+Build
+AI_CODE_AUDIT_FINDINGS.md
+AI_CODE_FIX_IMPLEMENTATION_PROMPT.md
+uuuu
+
+# --- Node / pnpm ---
+node_modules/
+frontend/dist/
+.pnpm-store/
+
+# --- Reference clones & cached docs (Phase 0 read-only material, not shipped) ---
+reference/
+docs-cache/
+
+# --- Runtime data volumes (never commit user data) ---
+data/
+# ...except the bundled models.dev catalog snapshot (offline fallback, not user data).
+!backend/app/data/
+!backend/app/data/models_dev_catalog.json
+*.sqlite3
+
+# --- OS / editor noise ---
+Thumbs.db
+.DS_Store
+*.swp
+.idea/
+.vscode/

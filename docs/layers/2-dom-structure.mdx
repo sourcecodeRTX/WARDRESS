@@ -1,0 +1,122 @@
+---
+title: "Layer 2: DOM Structure"
+description: "Detects structural tampering, script injections, iframe hijacks, and hidden elements."
+icon: "code"
+---
+
+The **DOM Structure Layer** inspects the tag tree of the page, independent of how it renders. Defacements frequently inject hidden elements, add `<script>` or `<iframe>` nodes, or gut the original markup — all of which show up as structural deltas even when the visual layout is manipulated to hide them.
+
+<Info>
+  Source: `backend/worker/detection/dom.py` (`layer2_dom_structure`, `_tree_stats`, `parse_html`). Input: the suppression-filtered, volatility-normalized HTML of both sides.
+</Info>
+
+## Parsing: lxml with recovery
+
+Layer 2 parses with **lxml's** `HTMLParser(recover=True)`, not BeautifulSoup. libxml2 recovers from arbitrarily broken markup without raising, so a malformed page never crashes the layer. A page that produces no tree at all (for example an empty string) is reported in evidence rather than raised.
+
+```python
+parser = lxml_html.HTMLParser(recover=True)
+root = lxml_html.document_fromstring(text, parser=parser)
+```
+
+If **both** sides fail to parse, the layer returns `0.0` with a note. If **one** side parses and the other does not, that is treated as a drastic change and scored `1.0`.
+
+## Deep dive mechanism
+
+```mermaid actions={true}
+flowchart LR
+    HTML["Suppressed HTML"]:::in --> P{{"lxml recover-parse<br/>→ element tree"}}
+    P --> S["Tree statistics<br/>depth · counts · attrs"]:::node
+    S --> CH["Tag churn<br/>content-aware weight"]:::node
+    S --> SN["Sensitive tags<br/>script · iframe · hidden"]:::node
+    CH & SN --> M(("max")):::pick
+    M --> OUT["Layer 2<br/>0.0 – 1.0"]:::out
+
+    classDef in fill:#311b92,stroke:#7c4dff,color:#fff;
+    classDef node fill:#4527a0,stroke:#9575cd,color:#fff;
+    classDef pick fill:#7c4dff,stroke:#b388ff,color:#fff;
+    classDef out fill:#5e35b1,stroke:#b39ddb,color:#fff,stroke-width:3px;
+```
+
+The layer walks the tree once and extracts a statistics bundle for each side: total element count, maximum depth, per-tag counts, and dedicated counts for `<script>`, `<iframe>`, and hidden elements. It then computes two scores and takes the larger.
+
+<AccordionGroup>
+  <Accordion title="Structural churn" icon="chart-column">
+    From the per-tag `Counter`s, the layer computes how many tag instances were added and removed. Churn is `sum(added) + sum(removed)`, saturating against half the tree:
+
+    ```python
+    churn_score = min(1.0, churn / (0.5 * total))
+    ```
+
+    where `total = max(baseline_elements, current_elements, 1)`. Roughly half the tree changing drives `churn_score` to `1.0`. This term is then weighted before the final score — and the weight depends on **what** changed:
+
+    - **Content-only churn** — every added and removed tag is an ordinary content element (`<article>`, `<p>`, `<li>`, `<div>` and the rest of the publishing set in `_CONTENT_CHURN_TAGS`) — receives a **reduced** weight. New articles, refreshed feeds, and content-only redesigns are the benign churn class; scoring them like structural overhauls made the fusion model read them as mild attack evidence.
+    - **Infrastructure churn** — the delta touches anything else (`<script>`, `<iframe>`, `<form>`, `<link>`, form controls, embedded objects such as `<svg>`/`<math>`, or any unknown/custom tag) — keeps the **full** weight. The content list is deliberately closed: tags it doesn't recognize fail safe toward detection.
+  </Accordion>
+  <Accordion title="Sensitive-tag deltas" icon="triangle-exclamation">
+    New `<script>`, `<iframe>`, and hidden elements get a dedicated boost — one injected script on a 1,000-element page is negligible churn but a serious signal. Their combined increase saturates through an exponential:
+
+    ```python
+    sensitive = new_scripts + new_iframes + new_hidden
+    sensitive_score = 1 - math.exp(-0.7 * sensitive)
+    ```
+
+    A single new sensitive element yields ≈ 0.50; two yields ≈ 0.75; three ≈ 0.88.
+  </Accordion>
+  <Accordion title="Hidden-element detection" icon="eye-slash">
+    Hiding is detected **independently of technique**. An element counts as hidden when a decisive hiding property resolves against it, drawn from three sources folded in cascade order — matching rules from the page's own `<style>` blocks (class/id/tag selectors, last declaration wins), then the element's inline `style` (which overrides sheet rules):
+
+    - the `hidden` attribute;
+    - `display: none` or `visibility: hidden`/`collapse`;
+    - `opacity: 0` or `font-size: 0`;
+    - `position: absolute|fixed` with any negative offset (offscreen placement);
+    - `text-indent` ≤ −100px or a `translate()` component ≤ −500px.
+
+    This catches the idiomatic `.spam { display: none }` stylesheet class as readily as an inline style. Deliberate exclusions keep false positives out: `@media`/`@supports`/`@keyframes` blocks are skipped whole (print/responsive styles can never manufacture hidden counts), non-rendering tags (`script`, `style`, `meta`, …) never count, and `input[type=hidden]` (CSRF tokens) is excluded.
+  </Accordion>
+</AccordionGroup>
+
+The final score is:
+
+```python
+score = max(churn_score * churn_weight, sensitive_score)
+```
+
+where `churn_weight` is the content-aware weight from the structural-churn accordion above. The classification and the weight applied are recorded in evidence (`churn_class`, `churn_weight`) so a reduced score is always auditable.
+
+Maximum tree-depth delta is recorded in evidence for context but does not directly drive the score.
+
+## Evidence recorded
+
+The findings row includes baseline and current element counts, the top added and removed tags (capped at 50 items), the churn classification and weight (`churn_class` / `churn_weight`), script / iframe / hidden counts for both sides, the max-depth delta, and the raw structural churn. Hidden elements carry a per-side attribution block (`hidden_detection`): how much stylesheet text was resolved, and which source hid each counted element (`hidden-attribute`, `inline-style`, or the deciding rule's selector subject). When suppression content rules applied, a `suppression_applied` summary is attached. When the automatic volatile-text normalization pass replaced anything, a `normalization_applied` summary (replacement counts by category) is attached.
+
+## False-positive suppression
+
+Layer 2 receives the **suppression-filtered** copy of both pages. If an operator defines a CSS-selector rule (for example `#visitor-counter`), the matching subtree is dropped from *both* baseline and current via lxml `drop_tree()` before the tree is analyzed — so a widget that adds child nodes every second does not inflate structural risk.
+
+On top of operator rules, an **automatic volatile-text normalization** pass (`backend/worker/detection/normalize.py`) replaces universally-volatile text — ISO 8601 timestamps, date stamps, UUIDs — in both sides' text nodes before the tree is analyzed. It is conservative by design: it only ever touches patterns that cannot plausibly be attack evidence (headlines, injected words, and signatures are never rewritten), and it never touches `<script>`/`<style>` inner text or inline styles (hidden-element detection resolves the latter).
+
+<CodeGroup>
+```html Raw (Without Suppression)
+<!-- Baseline and Current have churning counts (triggers false alarm) -->
+<body>
+  <div id="hero">Welcome</div>
+  <div id="visitor-counter">4,120 visits</div> <!-- Baseline -->
+  <!-- Current scan has 4,185 visits (+3 nodes) -->
+</body>
+```
+
+```html Suppressed (Both Sides Cleaned)
+<!-- #visitor-counter dropped via lxml drop_tree() -> Churn = 0.0 -->
+<body>
+  <div id="hero">Welcome</div>
+  <!-- #visitor-counter dropped by suppression -->
+</body>
+```
+</CodeGroup>
+
+## What this layer does and does not do
+
+<Warning>
+  **Common misconception:** Layer 2 does *not* hash the text content of individual inline `<script>` tags. It counts scripts and diffs tag-set structure. A payload appended inside an existing inline script with no change to tag counts is caught by the [Content Hash](/layers/1-content-hash) (the bytes changed, opening the gate) and, if it introduces a new external domain, by [Link Audit](/layers/3-link-audit) and the fusion model — not by a per-script content hash here.
+</Warning>

@@ -1,0 +1,452 @@
+# Wardress uninstaller (Windows, Docker Desktop).
+#
+#   powershell -ExecutionPolicy Bypass -File scripts\uninstall.ps1
+#
+# What it does, in order:
+#   1. Verifies Docker Desktop is running.
+#   2. Backs up everything recoverable to a timestamped folder (unless
+#      -SkipBackup): your .env, a logical Postgres dump (pg_dump, captured
+#      byte-exact via docker compose cp - never re-encoded by a host
+#      shell), and the scan-artifacts volume (tar.gz). If any attempted
+#      part of the backup fails, the script STOPS before anything is
+#      deleted - re-run with -AllowIncompleteBackup to proceed anyway (the
+#      summary and exit code will report the incomplete backup).
+#   3. Removes the whole Wardress footprint from Docker: containers,
+#      networks, named volumes (db-data, redis-data, scan-artifacts,
+#      ollama-data), and the locally-built images.
+#   4. Removes the Desktop shortcut.
+#   5. Prints where the backup is and how to restore it.
+#
+# The repository files on disk are left in place - delete the folder
+# yourself if you also want the source gone. Exits non-zero with a
+# readable message on any failure.
+
+[CmdletBinding()]
+param(
+    # Skip the confirmation prompt (for scripted/unattended teardown).
+    [switch]$Force,
+    # Skip the data backup entirely (containers/volumes/images still removed).
+    [switch]$SkipBackup,
+    # Proceed with removal even when a backup was attempted but came out
+    # incomplete (e.g. the database dump failed). Without this switch an
+    # incomplete backup STOPS the script before anything is deleted. The
+    # data-loss risk is yours when you pass it.
+    [switch]$AllowIncompleteBackup,
+    # Where to write the backup. Defaults to a timestamped folder next to
+    # the repo. The timestamp is filesystem-safe (no colons).
+    [string]$BackupPath,
+    # Leave the locally-built Wardress images in place (only remove
+    # containers, networks, and volumes).
+    [switch]$KeepImages,
+    # Also remove the pulled upstream base images (postgres, redis, uv,
+    # playwright, node, ollama). Off by default because these are shared,
+    # reusable, and slow to re-pull; pass this for a full-footprint wipe.
+    [switch]$PruneBaseImages
+)
+
+$ErrorActionPreference = "Stop"
+Set-StrictMode -Version Latest
+
+$RepoRoot = Split-Path -Parent $PSScriptRoot
+$EnvFile = Join-Path $RepoRoot ".env"
+$Project = "wardress"   # docker-compose.yml `name:` - volumes are $Project_<vol>
+
+# Shared helpers (Fail/Step/Invoke-*, dynamic image discovery).
+. (Join-Path $PSScriptRoot "lib.ps1")
+
+# Set total steps for progress tracking. The budget is per-path so the
+# display reaches exactly 100% on every run: the standard backup path
+# executes 7 Steps and -SkipBackup executes 3; -PruneBaseImages adds one
+# more either way.
+$totalSteps = 7
+if ($SkipBackup) { $totalSteps = 3 }
+if ($PruneBaseImages) { $totalSteps++ }
+Set-TotalSteps $totalSteps
+
+# --- 1. Preconditions ----------------------------------------------------
+
+Step "Checking Docker Desktop"
+if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
+    Fail ("Docker is not installed (the 'docker' command was not found). " +
+        "There is nothing for this script to remove.")
+}
+$info = Invoke-NativeWithDeadline "docker" @("info") 30
+if ($null -eq $info) {
+    Fail ("The Docker CLI did not respond within 30 seconds - the Docker Desktop backend appears wedged. " +
+        "Restart Docker Desktop, wait for 'Engine running', then re-run this script.")
+}
+if (-not $info) {
+    Fail ("Docker Desktop is installed but the engine is not running. " +
+        "Start Docker Desktop, wait for 'Engine running', then re-run this script.")
+}
+
+Set-Location $RepoRoot
+Write-Progress-Done "Docker Desktop is running"
+
+# --- 2. Confirm ----------------------------------------------------------
+
+if (-not $Force) {
+    Write-Host ""
+    Write-Host "This will REMOVE Wardress from Docker:" -ForegroundColor Yellow
+    Write-Host "  - all Wardress containers (app, worker, beat, telegram-bot, db, redis, ollama)"
+    Write-Host "  - the Wardress network"
+    Write-Host "  - the data volumes (database, redis, scan artifacts, ollama models)"
+    if (-not $KeepImages) { Write-Host "  - the locally-built Wardress images" }
+    if ($PruneBaseImages) { Write-Host "  - the pulled base images (postgres, redis, uv, playwright, node, ollama)" }
+    if (-not $SkipBackup) {
+        Write-Host ""
+        Write-Host "A backup (.env + database dump + scan artifacts) is taken FIRST." -ForegroundColor Green
+        Write-Host "If any part of the backup fails, the removal stops before deleting." -ForegroundColor Green
+    }
+    else {
+        Write-Host ""
+        Write-Host "-SkipBackup was passed: NO backup will be taken. Data loss is permanent." -ForegroundColor Red
+    }
+    Write-Host ""
+    $answer = Read-Host "Type 'yes' to proceed"
+    if ($answer -ne "yes") {
+        Write-Host "Aborted - nothing was changed." -ForegroundColor Green
+        exit 0
+    }
+}
+
+# --- 3. Backup -----------------------------------------------------------
+
+$backupDir = $null
+# Completeness tracking: a backup is complete only when every component that
+# was ATTEMPTED actually landed on disk. Components that do not exist at all
+# (no .env yet, no scan-artifacts volume) are gaps, not failed captures.
+$missing = [System.Collections.Generic.List[string]]::new()
+if (-not $SkipBackup) {
+    # Filesystem-safe timestamp (no colons); avoids Get-Date format pitfalls.
+    $stamp = (Get-Date).ToString("yyyy-MM-dd_HH-mm-ss")
+    if ($BackupPath) {
+        $backupDir = $BackupPath
+    }
+    else {
+        $backupDir = Join-Path (Split-Path -Parent $RepoRoot) "wardress-backup-$stamp"
+    }
+    New-Item -ItemType Directory -Path $backupDir -Force | Out-Null
+    Write-Host "    Backup location: $backupDir" -ForegroundColor Cyan
+
+    # A reused -BackupPath may hold files from an earlier run. Remove the
+    # managed filenames so this folder always describes THIS attempt.
+    foreach ($stale in @(".env", "database.sql", "scan-artifacts.tar.gz")) {
+        $stalePath = Join-Path $backupDir $stale
+        if (Test-Path $stalePath) { Remove-Item $stalePath -Force -ErrorAction SilentlyContinue }
+    }
+
+    # 3a. .env (holds every secret + admin credentials).
+    Step "Backing up .env configuration"
+    if (Test-Path $EnvFile) {
+        Copy-Item $EnvFile (Join-Path $backupDir ".env") -Force
+        Write-Progress-Done "Saved .env"
+    }
+    else {
+        Write-Host "    No .env found - skipping" -ForegroundColor Yellow
+    }
+
+    # Read DB user/name for the dump (defaults match docker-compose.yml).
+    $pgUser = "wardress"; $pgDb = "wardress"
+    if (Test-Path $EnvFile) {
+        foreach ($line in Get-Content $EnvFile) {
+            if ($line -match "^POSTGRES_USER=(.*)$") { $pgUser = $Matches[1].Trim() }
+            elseif ($line -match "^POSTGRES_DB=(.*)$") { $pgDb = $Matches[1].Trim() }
+        }
+    }
+
+    # 3b. Postgres logical dump. Bring db up (safe if already running),
+    # wait for readiness, then pg_dump through the running container.
+    Step "Backing up database with pg_dump"
+    if (Invoke-Quiet { docker compose up -d db }) {
+        $ready = $false
+        $deadline = (Get-Date).AddSeconds(60)
+        Write-Progress-Inline "Waiting for database to be ready..."
+        
+        while ((Get-Date) -lt $deadline) {
+            if (Invoke-Quiet { docker compose exec -T db pg_isready -U $pgUser -d $pgDb }) {
+                $ready = $true; break
+            }
+            Start-Sleep -Seconds 2
+        }
+        
+        if ($ready) {
+            $dumpFile = Join-Path $backupDir "database.sql"
+            # The dump is produced INSIDE the container and copied out with
+            # `docker compose cp`, so no host shell ever touches the byte
+            # stream: redirecting native output through PowerShell's text
+            # layer re-encodes it (UTF-16LE + BOM under Windows PowerShell
+            # 5.1, with content loss whenever the console codepage is not
+            # UTF-8), which silently corrupts every non-ASCII character.
+            $containerDump = "/tmp/wardress-uninstall-dump.sql"
+
+            Write-Progress-Inline "Dumping database..."
+            $dumpOk = Invoke-Quiet {
+                docker compose exec -T db sh -c 'pg_dump -U "$1" --clean --if-exists "$2" > "$3"' sh $pgUser $pgDb $containerDump
+            }
+            if ($dumpOk) {
+                $dumpOk = Invoke-Quiet { docker compose cp "db:$containerDump" "$dumpFile" }
+                if (-not $dumpOk) {
+                    Write-Host "    Database dump could not be copied out of the container" -ForegroundColor Yellow
+                    $missing.Add("database.sql (database dump could not be copied out)")
+                }
+            }
+            else {
+                Write-Host "    Database dump failed - database may already be gone" -ForegroundColor Yellow
+                $missing.Add("database.sql (pg_dump failed)")
+            }
+            # Best-effort cleanup of the container-side copy either way.
+            [void](Invoke-Quiet { docker compose exec -T db rm -f $containerDump })
+
+            # A failed attempt may leave a partial copy behind - clear it so
+            # the completeness check below cannot pass on leftover bytes.
+            if (-not $dumpOk) {
+                Remove-Item $dumpFile -ErrorAction SilentlyContinue
+            }
+
+            if ($missing.Count -eq 0) {
+                # Sanity check before declaring victory: a plain-format
+                # pg_dump always begins with an ASCII "--" comment header,
+                # so a zero-byte or binary-garbage file is a failed capture
+                # even when every command exited 0.
+                $sane = $false
+                try {
+                    $fs = [System.IO.File]::OpenRead($dumpFile)
+                    try {
+                        $buf = New-Object byte[] 32
+                        $n = $fs.Read($buf, 0, 32)
+                        $head = [System.Text.Encoding]::ASCII.GetString($buf, 0, $n)
+                        $sane = ($n -gt 0) -and $head.StartsWith("--")
+                    }
+                    finally { $fs.Dispose() }
+                }
+                catch { $sane = $false }
+
+                if ($sane) {
+                    $sizeMB = [math]::Round((Get-Item $dumpFile).Length / 1MB, 2)
+                    Write-Progress-Done "Saved database.sql ($sizeMB MB, byte-exact)"
+                }
+                else {
+                    Write-Host "    Database dump verification failed (empty or malformed file)" -ForegroundColor Yellow
+                    $missing.Add("database.sql (database dump verification failed)")
+                    Remove-Item $dumpFile -ErrorAction SilentlyContinue
+                }
+            }
+        }
+        else {
+            Write-Host "    Database did not become ready - skipping dump" -ForegroundColor Yellow
+            $missing.Add("database.sql (database never became ready)")
+        }
+    }
+    else {
+        Write-Host "    Could not start database container - skipping dump" -ForegroundColor Yellow
+        $missing.Add("database.sql (database container could not be started)")
+    }
+
+    # 3c. Scan-artifacts volume (screenshots/HTML). Tar it out via a
+    # throwaway container mounting the named volume read-only. Reuse the
+    # db service's own image (already present locally, and it has tar) so
+    # the uninstaller never pulls a new image just to make a backup. The
+    # image ref is discovered from compose config - nothing hardcoded.
+    Step "Backing up scan artifacts volume"
+    $artVol = "${Project}_scan-artifacts"
+    $helperImage = Get-ComposeServiceImage "db"
+    if (Invoke-Quiet { docker volume inspect $artVol }) {
+        if (-not $helperImage) {
+            Write-Host "    Could not resolve helper image - skipping artifact archive" -ForegroundColor Yellow
+            $missing.Add("scan-artifacts.tar.gz (helper image could not be resolved)")
+        }
+        else {
+            $prev = $ErrorActionPreference
+            $ErrorActionPreference = "Continue"
+            $srcMount = $artVol + ":/data:ro"
+            $dstMount = $backupDir + ":/backup"
+            
+            Write-Progress-Inline "Archiving scan artifacts..."
+            docker run --rm -v $srcMount -v $dstMount --entrypoint tar $helperImage `
+                czf /backup/scan-artifacts.tar.gz -C /data . 2>$null
+            $tarOk = ($LASTEXITCODE -eq 0)
+            $ErrorActionPreference = $prev
+            
+            if ($tarOk) { 
+                $tarFile = Join-Path $backupDir "scan-artifacts.tar.gz"
+                $sizeMB = [math]::Round((Get-Item $tarFile).Length / 1MB, 2)
+                Write-Progress-Done "Saved scan-artifacts.tar.gz ($sizeMB MB)" 
+            }
+            else {
+                Write-Host "    Could not archive scan artifacts" -ForegroundColor Yellow
+                $missing.Add("scan-artifacts.tar.gz (archive command failed)")
+            }
+        }
+    }
+    else {
+        Write-Host "    No scan-artifacts volume found - skipping" -ForegroundColor Yellow
+    }
+
+    # 3d. A short restore note so the backup is self-describing. Generated
+    # from what THIS run actually captured - never a hardcoded manifest.
+    Step "Writing restore instructions"
+    $hasEnv  = Test-Path (Join-Path $backupDir ".env")
+    $hasDump = Test-Path (Join-Path $backupDir "database.sql")
+    $tarPath = Join-Path $backupDir "scan-artifacts.tar.gz"
+    $hasTar  = Test-Path $tarPath
+
+    $readme = "Wardress backup - $stamp`r`n=========================`r`n`r`n"
+    if ($missing.Count -gt 0) {
+        $readme += "WARNING: THIS BACKUP IS INCOMPLETE. The following could not be captured:`r`n"
+        foreach ($m in $missing) { $readme += "  - $m`r`n" }
+        $readme += "Once the Docker volumes are removed, these are unrecoverable.`r`n`r`n"
+    }
+    $readme += "Contents:`r`n"
+    if ($hasEnv) {
+        $readme += "  .env                    Your configuration and secrets (admin password, JWT/`r`n                          encryption keys, DB password). Keep this file safe.`r`n"
+    }
+    if ($hasDump) {
+        $readme += "  database.sql            Logical Postgres dump (pg_dump --clean --if-exists).`r`n"
+    }
+    if ($hasTar) {
+        $readme += "  scan-artifacts.tar.gz   Stored screenshots and captured HTML.`r`n"
+    }
+
+    $stepNo = 0
+    $readme += "`r`nTo restore into a fresh install:`r`n"
+    if ($hasEnv) {
+        $stepNo++
+        $readme += "  $stepNo. Reinstall Wardress but BEFORE first run, copy this .env back into the`r`n     repo root (so the same DB password / keys are used):`r`n         copy `"$backupDir\.env`" `"<repo>\.env`"`r`n"
+    }
+    $stepNo++
+    $readme += "  $stepNo. Start the stack once so the database exists:`r`n         powershell -ExecutionPolicy Bypass -File scripts\install.ps1`r`n"
+    if ($hasDump) {
+        $stepNo++
+        $readme += "  $stepNo. Restore the database (byte-exact copy into the container, then load -`r`n     never pipe the file through a host shell, which would re-encode it):`r`n         docker compose cp `"$backupDir\database.sql`" db:/tmp/restore.sql`r`n         docker compose exec -T db psql -U $pgUser -d $pgDb -f /tmp/restore.sql`r`n         docker compose exec -T db rm /tmp/restore.sql`r`n"
+    }
+    if ($hasTar -and $helperImage) {
+        $stepNo++
+        $readme += "  $stepNo. Restore artifacts into the volume (the db image is already present`r`n     after step 2, so this pulls nothing new):`r`n         docker run --rm -v ${Project}_scan-artifacts:/data -v `"${backupDir}:/backup`" --entrypoint tar $helperImage xzf /backup/scan-artifacts.tar.gz -C /data`r`n"
+    }
+    $stepNo++
+    $readme += "  $stepNo. Restart:`r`n         docker compose up -d`r`n"
+
+    Set-Content -Path (Join-Path $backupDir "RESTORE.txt") -Value $readme -Encoding UTF8
+
+    if ($missing.Count -gt 0) {
+        Write-Host ("    Backup INCOMPLETE - missing: " + ($missing -join "; ")) -ForegroundColor Yellow
+    }
+    else {
+        Write-Progress-Done "Backup completed successfully"
+    }
+}
+
+# The backup is the operator's only copy of the data that is about to be
+# destroyed, so an incomplete backup stops the removal right here - before
+# anything has been deleted - unless it was explicitly accepted.
+if ($missing.Count -gt 0 -and -not $AllowIncompleteBackup) {
+    Fail ("The backup is INCOMPLETE (" + ($missing -join "; ") + "). " +
+        "Nothing was deleted - your data is still in Docker. " +
+        "Partial backup saved to: $backupDir. Fix the cause and re-run for a full backup, " +
+        "or pass -AllowIncompleteBackup to accept the loss and remove Wardress anyway.")
+}
+$backupIncomplete = ($missing.Count -gt 0)
+
+# --- 4. Tear down Docker resources --------------------------------------
+
+Step "Removing Wardress containers, network, and volumes"
+# --profile flags so profiled services (telegram-bot, ollama) are included.
+# -v removes named volumes; --remove-orphans sweeps any stragglers.
+$downArgs = @("--profile", "telegram", "--profile", "ollama", "down", "-v", "--remove-orphans")
+if (-not $KeepImages) { $downArgs += @("--rmi", "local") }
+$prev = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
+& docker compose @downArgs
+$downExit = $LASTEXITCODE
+$ErrorActionPreference = $prev
+if ($downExit -ne 0) {
+    Write-Host ("  'docker compose down' returned $downExit - some resources may already be gone. " +
+        "Continuing to a best-effort sweep.") -ForegroundColor Yellow
+}
+
+# Best-effort sweep of the named volumes in case a non-standard project
+# name or an interrupted prior run left them behind.
+foreach ($vol in @("db-data", "redis-data", "scan-artifacts", "ollama-data")) {
+    $full = "${Project}_$vol"
+    if (Invoke-Quiet { docker volume inspect $full }) {
+        [void](Invoke-Quiet { docker volume rm $full })
+    }
+}
+
+# --- 4b. Optionally remove the pulled base images -----------------------
+#
+# `docker compose down --rmi local` only removes images BUILT by compose
+# (wardress-app/worker/beat). The upstream base images pulled from
+# registries (postgres, redis, the uv/playwright/node build bases, and
+# ollama) are shared/reusable and are left by default. -PruneBaseImages
+# removes them too, for a full-footprint wipe. The image set is discovered
+# dynamically from the Dockerfiles + compose config - nothing hardcoded.
+if ($PruneBaseImages) {
+    Step "Removing pulled base images (-PruneBaseImages)"
+    $baseImages = @()
+    $baseImages += Get-BuildBaseImages $RepoRoot
+    $baseImages += Get-ComposeRemoteImages @("telegram", "ollama")
+    foreach ($img in ($baseImages | Select-Object -Unique)) {
+        if (Invoke-Quiet { docker image inspect $img }) {
+            if (Invoke-Quiet { docker rmi $img }) {
+                Write-Host "  Removed $img"
+            }
+            else {
+                Write-Host "  Kept $img (still in use by another project or has dependents)." -ForegroundColor Yellow
+            }
+        }
+    }
+}
+
+# --- 5. Remove the Desktop shortcut -------------------------------------
+
+Step "Removing the Desktop shortcut"
+try {
+    $desktop = [Environment]::GetFolderPath("Desktop")
+    $lnk = Join-Path $desktop "Wardress.lnk"
+    if (Test-Path $lnk) {
+        Remove-Item $lnk -Force
+        Write-Host "  Removed $lnk"
+    }
+    else {
+        Write-Host "  No Desktop shortcut found."
+    }
+}
+catch {
+    Write-Host "  Could not remove the Desktop shortcut ($($_.Exception.Message))." -ForegroundColor Yellow
+}
+
+# --- 6. Summary ----------------------------------------------------------
+
+Write-Host ""
+Write-Host "----------------------------------------------------------------" -ForegroundColor Green
+Write-Host " Wardress has been removed from Docker." -ForegroundColor Green
+if ($SkipBackup) {
+    Write-Host " No backup was taken (-SkipBackup)." -ForegroundColor Yellow
+}
+elseif ($backupIncomplete) {
+    Write-Host " WARNING: the backup is INCOMPLETE:" -ForegroundColor Red
+    foreach ($m in $missing) { Write-Host "   - $m" -ForegroundColor Yellow }
+    Write-Host " Partial backup saved to:" -ForegroundColor Yellow
+    Write-Host "   $backupDir"
+    Write-Host " See RESTORE.txt in that folder for what did survive."
+}
+else {
+    Write-Host " Backup saved to:" -ForegroundColor Green
+    Write-Host "   $backupDir"
+    Write-Host " See RESTORE.txt in that folder to bring it back."
+}
+Write-Host ""
+Write-Host " The repository files are still on disk. Delete the folder"
+Write-Host " manually if you want the source gone as well."
+if (-not $PruneBaseImages) {
+    Write-Host ""
+    Write-Host " Shared base images (postgres, redis, uv, playwright, node) were" -ForegroundColor DarkGray
+    Write-Host " kept for reuse. Re-run with -PruneBaseImages to remove those too." -ForegroundColor DarkGray
+}
+Write-Host "----------------------------------------------------------------" -ForegroundColor Green
+# Exit 2 tells wrapper scripts the removal ran but the backup was incomplete
+# (exit 0 = full success or deliberate -SkipBackup; Fail above exits 1).
+if ($backupIncomplete) { exit 2 }
+exit 0

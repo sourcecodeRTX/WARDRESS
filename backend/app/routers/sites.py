@@ -1,0 +1,583 @@
+"""Site CRUD + baseline/scan endpoints (§7, extended for Phase 2)."""
+
+import uuid
+from datetime import UTC, datetime, timedelta
+from typing import Annotated
+
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app import services
+from app.audit import record_audit
+from app.capture import CAPTURE_METHOD_VERSION
+from app.db import get_db
+from app.deps import AnalystUser, CurrentUser
+from app.explain import ExplainError, explain_scan
+from app.models import (
+    Baseline,
+    Scan,
+    ScanFinding,
+    ScanStatus,
+    Site,
+    SuppressionRule,
+)
+from app.ratelimit import enforce_user_rate_limit
+from app.scanning import clamp_interval
+from app.schemas import (
+    BaselineOut,
+    ExplainResponse,
+    ScanDetailOut,
+    ScanFindingOut,
+    ScanOut,
+    ScanPage,
+    SiteCreate,
+    SiteDetailOut,
+    SiteOut,
+    SiteUpdate,
+    SuppressionRuleCreate,
+    SuppressionRuleOut,
+)
+from app.services import ServiceError, site_snapshot
+from app.site_icons import get_favicon_enabled, resolve_site_icon
+
+router = APIRouter(prefix="/api/sites", tags=["sites"])
+
+
+def _http_from_service(exc: ServiceError) -> HTTPException:
+    """Translate a shared-service domain error to the router's HTTP shape."""
+    return HTTPException(exc.status_code, exc.message)
+
+
+async def _get_site_or_404(db: AsyncSession, site_id: uuid.UUID) -> Site:
+    site = await db.scalar(select(Site).where(Site.id == site_id))
+    if site is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Site not found")
+    return site
+
+
+async def _current_baseline(db: AsyncSession, site_id: uuid.UUID) -> Baseline | None:
+    return await db.scalar(
+        select(Baseline).where(Baseline.site_id == site_id, Baseline.is_current.is_(True))
+    )
+
+
+# How far back the consecutive-degradation walk looks. Bounded: this is an
+# investigation aid, not a forensic query.
+_DEGRADED_LOOKBACK = 10
+
+
+def _has_degraded_layer(layer_scores: dict | None) -> bool:
+    """True when any layer of this scan ran degraded (capture/probe side
+    failed). Historical rows predating the flag read as non-degraded —
+    their capture health simply cannot be reclassified."""
+    return any((entry or {}).get("degraded") for entry in (layer_scores or {}).values())
+
+
+async def _consecutive_degraded_scans(db: AsyncSession, site_id: uuid.UUID) -> int:
+    """Length of the leading run of completed scans (newest first) that
+    each had at least one degraded detection layer."""
+    scores = (
+        await db.scalars(
+            select(Scan.layer_scores)
+            .where(Scan.site_id == site_id, Scan.status == ScanStatus.completed)
+            .order_by(Scan.created_at.desc(), Scan.id.desc())
+            .limit(_DEGRADED_LOOKBACK)
+        )
+    ).all()
+    count = 0
+    for layer_scores in scores:
+        if not _has_degraded_layer(layer_scores):
+            break
+        count += 1
+    return count
+
+
+def _rebaseline_hint(baseline: Baseline | None) -> tuple[int | None, bool]:
+    """(baseline capture-method version, needs-rebaseline) for the
+    site-detail hint (PROMPT-002 Phase 7). A baseline that predates
+    versioning reports None and never hints — absence is unknown, not
+    old; only a recorded version strictly below the current capture
+    flow's version means the next scans can flag one-time structural
+    deltas."""
+    if baseline is None:
+        return None, False
+    version = (baseline.capture_meta or {}).get("capture_method_version")
+    if not isinstance(version, int):
+        return None, False
+    return version, version < CAPTURE_METHOD_VERSION
+
+
+@router.post("", response_model=SiteDetailOut, status_code=status.HTTP_201_CREATED)
+async def create_site(
+    body: SiteCreate,
+    user: AnalystUser,
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> SiteDetailOut:
+    try:
+        site, baseline = await services.create_site(
+            db,
+            name=body.name,
+            url=str(body.url),
+            actor=user,
+            via="dashboard",
+            allow_private_networks=body.allow_private_networks,
+            flag_threshold=body.flag_threshold,
+            auto_scan_enabled=body.auto_scan_enabled,
+            scan_interval_minutes=body.scan_interval_minutes,
+        )
+    except ServiceError as exc:
+        raise _http_from_service(exc) from None
+    return SiteDetailOut(
+        **SiteOut.model_validate(site).model_dump(),
+        baseline_id=baseline.id,
+        baseline_status=baseline.status,
+        current_capture_method_version=CAPTURE_METHOD_VERSION,
+    )
+
+
+@router.get("", response_model=list[SiteDetailOut])
+async def list_sites(
+    user: CurrentUser,
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> list[SiteDetailOut]:
+    """All sites newest-first with their baseline summary, in a constant
+    number of queries (sites + current-baselines + newest-fallbacks) —
+    never per-site round trips."""
+    sites = (await db.scalars(select(Site).order_by(Site.created_at.desc()))).all()
+    if not sites:
+        return []
+    site_ids = [site.id for site in sites]
+
+    # Preferred: each site's current baseline.
+    current_by_site = {
+        baseline.site_id: baseline
+        for baseline in (
+            await db.scalars(
+                select(Baseline).where(
+                    Baseline.site_id.in_(site_ids), Baseline.is_current.is_(True)
+                )
+            )
+        ).all()
+    }
+
+    # Fallback for sites without one: their newest capture attempt (so
+    # pending/failed captures stay visible in the list), fetched in bulk
+    # via a max(created_at)-per-site join. Ties resolve deterministically.
+    latest = (
+        select(Baseline.site_id.label("site_id"), func.max(Baseline.created_at).label("mx"))
+        .where(Baseline.site_id.in_(site_ids))
+        .group_by(Baseline.site_id)
+        .subquery()
+    )
+    newest_by_site: dict[uuid.UUID, Baseline] = {}
+    for baseline in (
+        await db.scalars(
+            select(Baseline).join(
+                latest,
+                (Baseline.site_id == latest.c.site_id) & (Baseline.created_at == latest.c.mx),
+            )
+        )
+    ).all():
+        seen = newest_by_site.get(baseline.site_id)
+        if seen is None or (baseline.created_at, baseline.id) > (seen.created_at, seen.id):
+            newest_by_site[baseline.site_id] = baseline
+
+    out = []
+    for site in sites:
+        baseline = current_by_site.get(site.id) or newest_by_site.get(site.id)
+        # The list surface carries the re-baseline hint fields too, so the
+        # sites page and the detail page agree (Phase 7): the current flow
+        # version always; the baseline's version via the same helper the
+        # detail endpoint uses (absence = unknown, never old).
+        baseline_version, needs_rebaseline = _rebaseline_hint(baseline)
+        out.append(
+            SiteDetailOut(
+                **SiteOut.model_validate(site).model_dump(),
+                baseline_id=baseline.id if baseline else None,
+                baseline_status=baseline.status if baseline else None,
+                baseline_captured_at=baseline.captured_at if baseline else None,
+                baseline_error=baseline.error if baseline else None,
+                baseline_capture_method_version=baseline_version,
+                current_capture_method_version=CAPTURE_METHOD_VERSION,
+                needs_rebaseline=needs_rebaseline,
+            )
+        )
+    return out
+
+
+@router.get("/{site_id}", response_model=SiteDetailOut)
+async def get_site(
+    site_id: uuid.UUID,
+    user: CurrentUser,
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> SiteDetailOut:
+    site = await _get_site_or_404(db, site_id)
+    baseline = await _current_baseline(db, site.id)
+    if baseline is None:
+        baseline = await db.scalar(
+            select(Baseline)
+            .where(Baseline.site_id == site.id)
+            .order_by(Baseline.created_at.desc())
+            .limit(1)
+        )
+    baseline_version, needs_rebaseline = _rebaseline_hint(baseline)
+    return SiteDetailOut(
+        **SiteOut.model_validate(site).model_dump(),
+        baseline_id=baseline.id if baseline else None,
+        baseline_status=baseline.status if baseline else None,
+        baseline_captured_at=baseline.captured_at if baseline else None,
+        baseline_error=baseline.error if baseline else None,
+        consecutive_degraded_scans=await _consecutive_degraded_scans(db, site.id),
+        baseline_capture_method_version=baseline_version,
+        current_capture_method_version=CAPTURE_METHOD_VERSION,
+        needs_rebaseline=needs_rebaseline,
+    )
+
+
+@router.patch("/{site_id}", response_model=SiteDetailOut)
+async def update_site(
+    site_id: uuid.UUID,
+    body: SiteUpdate,
+    user: AnalystUser,
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> SiteDetailOut:
+    """Per-site detection/scheduling settings (§5 threshold, §11 adaptive
+    interval). Name/URL edits are deliberately excluded — a different URL
+    means a different trust anchor, i.e. a new site."""
+    site = await _get_site_or_404(db, site_id)
+    before = site_snapshot(site)
+    if body.flag_threshold is not None:
+        site.flag_threshold = body.flag_threshold
+    if body.auto_scan_enabled is not None:
+        site.auto_scan_enabled = body.auto_scan_enabled
+        if not body.auto_scan_enabled:
+            site.next_scan_at = None
+        elif site.next_scan_at is None:
+            site.next_scan_at = datetime.now(UTC) + timedelta(
+                minutes=clamp_interval(site.scan_interval_minutes)
+            )
+    if body.scan_interval_minutes is not None:
+        site.scan_interval_minutes = clamp_interval(body.scan_interval_minutes)
+        # A new base cadence resets the adaptive state: the user asked for
+        # this rhythm, so honor it from the next scan onward.
+        site.current_interval_minutes = None
+        if site.auto_scan_enabled:
+            site.next_scan_at = datetime.now(UTC) + timedelta(minutes=site.scan_interval_minutes)
+    if body.mute_minutes is not None:
+        # Alert mute (Phase 4): scans continue, only delivery is skipped
+        # (and recorded as skipped). 0 unmutes immediately.
+        site.muted_until = (
+            datetime.now(UTC) + timedelta(minutes=body.mute_minutes)
+            if body.mute_minutes > 0
+            else None
+        )
+    record_audit(
+        db,
+        actor=user,
+        action="site.mute" if body.mute_minutes is not None else "site.update",
+        target_type="site",
+        target_id=site.id,
+        target_label=site.name,
+        before=before,
+        after=site_snapshot(site),
+    )
+    await db.commit()
+
+    baseline = await _current_baseline(db, site.id)
+    if baseline is None:
+        baseline = await db.scalar(
+            select(Baseline)
+            .where(Baseline.site_id == site.id)
+            .order_by(Baseline.created_at.desc())
+            .limit(1)
+        )
+    baseline_version, needs_rebaseline = _rebaseline_hint(baseline)
+    return SiteDetailOut(
+        **SiteOut.model_validate(site).model_dump(),
+        baseline_id=baseline.id if baseline else None,
+        baseline_status=baseline.status if baseline else None,
+        baseline_captured_at=baseline.captured_at if baseline else None,
+        baseline_error=baseline.error if baseline else None,
+        baseline_capture_method_version=baseline_version,
+        current_capture_method_version=CAPTURE_METHOD_VERSION,
+        needs_rebaseline=needs_rebaseline,
+    )
+
+
+@router.delete("/{site_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_site(
+    site_id: uuid.UUID,
+    user: AnalystUser,
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> None:
+    site = await _get_site_or_404(db, site_id)
+    # Rows cascade; artifact files are cleaned by a janitor task in a later
+    # phase (deliberate deferral — files are small and harmless meanwhile).
+    record_audit(
+        db,
+        actor=user,
+        action="site.delete",
+        target_type="site",
+        target_id=site.id,
+        target_label=site.name,
+        before=site_snapshot(site),
+    )
+    await db.delete(site)
+    await db.commit()
+
+
+@router.post(
+    "/{site_id}/rebaseline",
+    response_model=BaselineOut,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def rebaseline(
+    site_id: uuid.UUID,
+    user: AnalystUser,
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> BaselineOut:
+    site = await _get_site_or_404(db, site_id)
+    try:
+        baseline = await services.rebaseline_site(db, site, actor=user, via="dashboard")
+    except ServiceError as exc:
+        raise _http_from_service(exc) from None
+    return BaselineOut.model_validate(baseline)
+
+
+@router.post(
+    "/{site_id}/scan-now",
+    response_model=ScanOut,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def scan_now(
+    site_id: uuid.UUID,
+    user: AnalystUser,
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> ScanOut:
+    site = await _get_site_or_404(db, site_id)
+    try:
+        scan = await services.trigger_scan_now(db, site, actor=user, via="dashboard")
+    except ServiceError as exc:
+        raise _http_from_service(exc) from None
+    return ScanOut.model_validate(scan)
+
+
+@router.get("/{site_id}/scans", response_model=ScanPage)
+async def list_scans(
+    site_id: uuid.UUID,
+    user: CurrentUser,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    offset: Annotated[int, Query(ge=0)] = 0,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+) -> ScanPage:
+    """Scan history, newest first, offset/limit paginated (deferred from
+    Phase 1) — the incident timeline reads deep history through this."""
+    await _get_site_or_404(db, site_id)
+    total = await db.scalar(select(func.count()).select_from(Scan).where(Scan.site_id == site_id))
+    scans = (
+        await db.scalars(
+            select(Scan)
+            .where(Scan.site_id == site_id)
+            .order_by(Scan.created_at.desc())
+            .offset(offset)
+            .limit(limit)
+        )
+    ).all()
+    return ScanPage(
+        items=[ScanOut.model_validate(s) for s in scans],
+        total=int(total or 0),
+        offset=offset,
+        limit=limit,
+    )
+
+
+@router.get("/{site_id}/scans/{scan_id}", response_model=ScanDetailOut)
+async def get_scan(
+    site_id: uuid.UUID,
+    scan_id: uuid.UUID,
+    user: CurrentUser,
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> ScanDetailOut:
+    """One scan with its per-layer findings — the §5 evidence drilldown
+    (full dashboard UI lands in Phase 3; the data contract lands now)."""
+    await _get_site_or_404(db, site_id)
+    scan = await db.scalar(select(Scan).where(Scan.id == scan_id, Scan.site_id == site_id))
+    if scan is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Scan not found")
+    findings = (
+        await db.scalars(
+            select(ScanFinding).where(ScanFinding.scan_id == scan.id).order_by(ScanFinding.layer)
+        )
+    ).all()
+    return ScanDetailOut(
+        **ScanOut.model_validate(scan).model_dump(),
+        findings=[ScanFindingOut.model_validate(f) for f in findings],
+        explanation=scan.explanation,
+        explanation_provider=scan.explanation_provider,
+        explanation_at=scan.explanation_at,
+    )
+
+
+@router.post("/{site_id}/scans/{scan_id}/explain", response_model=ExplainResponse)
+async def explain_incident(
+    site_id: uuid.UUID,
+    scan_id: uuid.UUID,
+    user: AnalystUser,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    force: Annotated[bool, Query()] = False,
+) -> ExplainResponse:
+    """§8 "Explain this incident": plain-English summary of the scan's
+    findings via the configured Gemini/Ollama provider, cached on the
+    scan. 503 when no provider is configured or it cannot answer — never
+    a crash, and never a blocker for anything else."""
+    await _get_site_or_404(db, site_id)
+    scan = await db.scalar(select(Scan).where(Scan.id == scan_id, Scan.site_id == site_id))
+    if scan is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Scan not found")
+    record_audit(
+        db,
+        actor=user,
+        action="scan.explain",
+        target_type="scan",
+        target_id=scan_id,
+        target_label=str(site_id),
+        after={"force": force},
+    )
+    try:
+        result = await explain_scan(db, scan_id, force=force)
+    except ExplainError as exc:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from None
+    return ExplainResponse(
+        explanation=result["explanation"],
+        provider=result["provider"],
+        generated_at=result["generated_at"],
+        cached=result["cached"],
+    )
+
+
+# --- Suppression rules (§5 false-positive suppression, §7 CRUD) ---
+
+
+@router.get("/{site_id}/suppression-rules", response_model=list[SuppressionRuleOut])
+async def list_suppression_rules(
+    site_id: uuid.UUID,
+    user: CurrentUser,
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> list[SuppressionRuleOut]:
+    site = await _get_site_or_404(db, site_id)
+    rules = await services.list_suppression_rules(db, site)
+    return [SuppressionRuleOut.model_validate(r) for r in rules]
+
+
+@router.post(
+    "/{site_id}/suppression-rules",
+    response_model=SuppressionRuleOut,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_suppression_rule(
+    site_id: uuid.UUID,
+    body: SuppressionRuleCreate,
+    user: AnalystUser,
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> SuppressionRuleOut:
+    """A new exclusion applies from the next scan onward — already-stored
+    findings are historical evidence and are never rewritten."""
+    site = await _get_site_or_404(db, site_id)
+    try:
+        rule = await services.create_suppression_rule(
+            db,
+            site,
+            type=body.type.value,
+            value=body.value,
+            note=body.note,
+            actor=user,
+            via="rest",
+        )
+    except ServiceError as exc:
+        raise _http_from_service(exc) from None
+    return SuppressionRuleOut.model_validate(rule)
+
+
+@router.delete(
+    "/{site_id}/suppression-rules/{rule_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+async def delete_suppression_rule(
+    site_id: uuid.UUID,
+    rule_id: uuid.UUID,
+    user: AnalystUser,
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> None:
+    await _get_site_or_404(db, site_id)
+    rule = await db.scalar(
+        select(SuppressionRule).where(
+            SuppressionRule.id == rule_id, SuppressionRule.site_id == site_id
+        )
+    )
+    if rule is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Suppression rule not found")
+    record_audit(
+        db,
+        actor=user,
+        action="suppression_rule.delete",
+        target_type="suppression_rule",
+        target_id=rule.id,
+        target_label=rule.type.value,
+        before={"type": rule.type.value, "value": rule.value, "note": rule.note},
+    )
+    await db.delete(rule)
+    await db.commit()
+
+
+# --- Opt-in favicon resolver (Phase 27 residual-risk follow-up) ---
+
+
+@router.get("/{site_id}/icon")
+async def get_site_icon(
+    request: Request,
+    site_id: uuid.UUID,
+    user: CurrentUser,
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> Response:
+    """The monitored site's cached favicon — raster bytes served to the
+    dashboard's fetch-as-blob pipeline (plain <img src> cannot carry the
+    Authorization header).
+
+    Setting OFF (default): 404 immediately, zero outbound work. Target
+    confidentiality is the default (Phase 27): sites pages render local
+    letter avatars and nothing about the watchlist leaves the deployment.
+
+    Setting ON: serve the cache when fresh/inside its windows; otherwise
+    attempt exactly one SSRF-gated fetch (app/site_icons.py documents the
+    security posture and the concurrency claim). Failures answer 404 so
+    the frontend falls back to the letter avatar — a missing favicon is
+    cosmetic here, never an error surfaced to operators. RBAC mirrors the
+    sites-read surface (any authenticated role); rate-limited per user
+    since images load in bursts on dashboard render.
+    """
+    enforce_user_rate_limit(request, str(user.id))
+    if not await get_favicon_enabled(db):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Site icon unavailable")
+
+    site = await _get_site_or_404(db, site_id)
+
+    row = None
+    try:
+        row, _fetched_now = await resolve_site_icon(db, site)
+    except Exception:
+        # A resolver crash must never surface as a 500 on a cosmetic image;
+        # the client falls back to the letter avatar either way.
+        row = None
+
+    if row is None or row.status != "ok" or not row.data:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Site icon unavailable")
+
+    return Response(
+        content=row.data,
+        media_type=row.content_type or "application/octet-stream",
+        headers={
+            # Private: per-operator authenticated resource; never proxy-cached.
+            "Cache-Control": "private, max-age=86400",
+        },
+    )

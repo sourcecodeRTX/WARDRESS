@@ -1,0 +1,144 @@
+[project]
+name = "wardress-backend"
+version = "0.1.0"
+description = "Wardress — self-hosted website defacement detection and monitoring platform (backend)"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+license = { text = "MIT" }
+dependencies = [
+    # --- Web framework / API ---
+    "fastapi==0.139.0",
+    "uvicorn[standard]==0.51.0",
+    "pydantic-settings==2.14.2",
+    # --- Persistence ---
+    "sqlalchemy[asyncio]==2.0.51",
+    "alembic==1.18.5",
+    "asyncpg==0.31.0",
+    # --- Task queue ---
+    "celery==5.6.3",
+    "redis==8.0.1",
+    # --- Detection engine ---
+    "playwright==1.61.0",
+    "lxml==6.1.1",
+    # cssselect backs lxml's CSSSelector, used to validate and apply
+    # css_selector suppression rules (§5). Already transitive via
+    # premailer — declared directly for the same reason as pillow/numpy.
+    "cssselect==1.4.0",
+    "scikit-image==0.26.0",
+    "imagehash==4.3.2",
+    # pillow/numpy arrive transitively (imagehash, scikit-image) but the
+    # detection layers import them directly — declare them so a transitive
+    # drop can never break us silently (rule 2; versions verified on PyPI).
+    "pillow==12.3.0",
+    "numpy==2.5.1",
+    "sentence-transformers==5.6.0",
+    "scikit-learn==1.9.0",
+    # torch is a transitive dep of sentence-transformers; it must be declared
+    # directly so [tool.uv.sources] can force the CPU-only wheel index
+    # (master prompt rule 3: no GPU dependencies, ever).
+    "torch>=2.5",
+    "httpx==0.28.1",
+    # Stealth patches for the Playwright capture (PROMPT-002 Phase 1):
+    # navigator.webdriver removal, chrome.runtime, codecs, WebGL, etc.
+    # Applied per-context by worker/stealth.py BEFORE the SSRF route guard;
+    # the module degrades gracefully (log + continue) when absent.
+    "playwright-stealth==2.0.3",
+    # --- Optional intelligence layer ---
+    "google-genai==2.12.0",
+    "aiolimiter==1.2.1",
+    # --- Notifications / reporting ---
+    "apprise==1.12.0",
+    "python-telegram-bot==22.8",
+    "jinja2==3.1.6",
+    "premailer==3.10.0",
+    "aiosmtplib==5.1.2",
+    "weasyprint==69.0",
+    # --- Security ---
+    "argon2-cffi==25.1.0",
+    "pyjwt==2.13.0",
+    "cryptography==50.0.0",
+    "litellm==1.93.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest==9.1.1",
+    "pytest-asyncio==1.4.0",
+    "ruff==0.15.21",
+    "pip-audit==2.10.1",
+    # In-memory async DB for unit tests (no Postgres needed on the host).
+    "aiosqlite==0.22.1",
+    "greenlet==3.5.3",
+    "faker>=40.37.0",
+    # scipy arrives transitively via scikit-learn but tools/refit_fusion_model
+    # imports it directly - declared so a transitive drop can never break the
+    # refit silently (same rule as pillow/numpy above).
+    "scipy==1.18.0",
+]
+
+# --- CPU-only torch (master prompt rule 3: no GPU dependencies, ever) ---
+# sentence-transformers pulls torch transitively; force the CPU wheel index
+# so no CUDA libraries ever enter the lockfile or the Docker image.
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu" }]
+torchvision = [{ index = "pytorch-cpu" }]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC", "S"]
+ignore = ["S101"]  # allow asserts in tests
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S105", "S106", "S311"]  # fake credentials; seeded RNG for synthetic data
+# Uninstall sandbox tests shell out to pwsh driving a fake docker shim —
+# argv lists built entirely from trusted, test-constructed values.
+"tests/test_uninstall_backup_safety.py" = ["S603"]
+# Migration-repair test drives the real alembic CLI against the harness
+# database — argv lists built entirely from trusted, literal values.
+"tests/test_sites_router_integrity.py" = ["S603"]
+# Phase 18's migration-repair proof also drives the real alembic CLI —
+# same trusted, literal argv shape.
+"tests/test_phase18_concurrency_races.py" = ["S603"]
+# Phase 29's ops-scripts sandbox shells out to pwsh/powershell driving the
+# fake docker shim — argv lists built entirely from trusted, literal values.
+"tests/test_phase29_ops_robustness.py" = ["S603"]
+# Phase 39 reuses the same sandbox methodology for the ops/config sweep.
+"tests/test_phase39_ops_config.py" = ["S603"]
+# Phase-13 e2e gate force-kills a wedged capture child via taskkill — the
+# argv is fully trusted/literal (the PID is the subprocess WE spawned).
+"tests/test_capture_e2e.py" = ["S603"]
+# Dataset builder seeds random.Random for synthetic-content variety only —
+# no security surface consumes these values.
+"tools/*" = ["S311"]
+# The torch advisory cross-check queries the fixed https OSV endpoint (its
+# scheme is pinned by the module constant; the url param exists for tests).
+"tools/check_torch_osv.py" = ["S310"]
+# Alembic's generated env.py needs a post-config import; autogenerated
+# revision files are not hand-wrapped.
+"alembic/env.py" = ["E402"]
+"alembic/versions/*" = ["E501"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+# PROMPT-002 Phase 13: the live-network e2e gate (tests/test_capture_e2e.py)
+# must be OPT-OUT by default, not opt-in by agent discipline. `network`
+# tests run only when the operator explicitly asks for them
+# (`pytest -m network` overrides this addopts filter).
+markers = ["network: live-network e2e captures (skipped in CI; run manually as a validation gate)"]
+addopts = "-m 'not network'"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["app", "worker"]

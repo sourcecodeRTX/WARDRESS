@@ -1,0 +1,403 @@
+# Shared helpers for the Wardress PowerShell scripts (install / update /
+# uninstall). Dot-sourced by each: . "$PSScriptRoot\lib.ps1"
+#
+# Design rule: NOTHING about images, tags, or registries is hardcoded here.
+# The image set is derived at runtime from the actual Dockerfiles and the
+# docker-compose config, so the scripts never drift from the real stack.
+
+$script:ProgressPreference = 'SilentlyContinue'
+$script:TotalSteps = 0
+$script:CurrentStep = 0
+
+function Fail([string]$Message) {
+    Write-Host ""
+    Write-Host "ERROR: $Message" -ForegroundColor Red
+    exit 1
+}
+
+function Step([string]$Message) {
+    $script:CurrentStep++
+    Write-Host ""
+    if ($script:TotalSteps -gt 0) {
+        $percent = [int](($script:CurrentStep / $script:TotalSteps) * 100)
+        Write-Host "[$script:CurrentStep/$script:TotalSteps - $percent%] ==> $Message" -ForegroundColor Cyan
+    } else {
+        Write-Host "==> $Message" -ForegroundColor Cyan
+    }
+}
+
+function Set-TotalSteps([int]$Total) {
+    $script:TotalSteps = $Total
+    $script:CurrentStep = 0
+}
+
+function Update-TotalSteps([int]$Total) {
+    # Re-budget the progress display WITHOUT resetting CurrentStep. Used once
+    # conditional steps become predictable (e.g. an optional service recreate
+    # detected during preflight) so the displayed total matches the steps that
+    # will actually run - percentages reach exactly 100% instead of overflowing
+    # past it or stalling below it. Set-TotalSteps stays script-top-only
+    # because it resets the counter.
+    $script:TotalSteps = $Total
+}
+
+function Write-Progress-Inline([string]$Message, [string]$Color = "Gray") {
+    Write-Host "    $Message" -ForegroundColor $Color -NoNewline
+    Write-Host "`r" -NoNewline
+}
+
+function Write-Progress-Done([string]$Message = "Done") {
+    Write-Host "    $Message" -ForegroundColor Green
+}
+
+function Invoke-Quiet([scriptblock]$Block) {
+    # Probe a native command, discarding all output. Under EAP=Stop,
+    # PowerShell 5.1 turns redirected native stderr (even harmless
+    # warnings) into terminating errors - relax it around the probe.
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        $null = & $Block 2>&1
+        return ($LASTEXITCODE -eq 0)
+    }
+    finally { $ErrorActionPreference = $prev }
+}
+
+function Invoke-NativeWithDeadline {
+    # Run a native command with a hard wall-clock deadline. Returns:
+    #   $true  - exited 0 within the deadline
+    #   $false - exited non-zero within the deadline
+    #   $null  - did NOT exit within the deadline (the CLI is wedged)
+    # Exists for the Docker engine-reachability probes at the top of every
+    # entry-point script: a wedged Docker CLI (stuck daemon pipe, hung WSL2
+    # backend, credential-helper stall) otherwise blocks the scripts
+    # forever with no output and no error. Output is deliberately NOT
+    # captured - it flows to the console, which also rules out any
+    # pipe-buffer deadlock while we wait.
+    #
+    # PS 5.1 compatible by design: no ArgumentList (build .Arguments with
+    # manual quoting), no ternary/null-coalescing operators.
+    param(
+        [string]$FilePath,
+        [string[]]$ArgumentList = @(),
+        [int]$TimeoutSeconds = 30
+    )
+    $resolved = Get-Command $FilePath -ErrorAction SilentlyContinue
+    if (-not $resolved) { return $false }
+    $exePath = $resolved.Source
+
+    function Quote-Arg([string]$Value) {
+        if ($Value -match '[\s"]') { return '"' + ($Value -replace '"', '\"') + '"' }
+        return $Value
+    }
+
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $ext = [System.IO.Path]::GetExtension($exePath).ToLowerInvariant()
+    if ($ext -eq ".cmd" -or $ext -eq ".bat") {
+        # Batch shims must go through cmd.exe (CreateProcess cannot exec
+        # them directly); /d /s /c "..." quotes the whole command safely.
+        $inner = @(Quote-Arg $exePath)
+        foreach ($a in $ArgumentList) { $inner += @(Quote-Arg $a) }
+        $psi.FileName = $env:ComSpec
+        $psi.Arguments = "/d /s /c `"$($inner -join ' ')`""
+    }
+    else {
+        $parts = @()
+        foreach ($a in $ArgumentList) { $parts += @(Quote-Arg $a) }
+        $psi.FileName = $exePath
+        $psi.Arguments = ($parts -join ' ')
+    }
+    $psi.UseShellExecute = $false
+
+    $proc = New-Object System.Diagnostics.Process
+    $proc.StartInfo = $psi
+    if (-not $proc.Start()) { return $false }
+    $null = $proc.Handle   # cache immediately so ExitCode is reliable later
+
+    if (-not $proc.WaitForExit($TimeoutSeconds * 1000)) {
+        # Deadline blown: kill the whole tree (docker.exe can spawn plugin
+        # children that would otherwise outlive us holding resources).
+        # NOTE: do not name anything $IsWindows here - that collides with
+        # PowerShell 7's read-only automatic variable and any assignment
+        # to it throws (silently skipping the kill if caught upstream).
+        try {
+            if ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) {
+                $prevEap = $ErrorActionPreference
+                $ErrorActionPreference = "Continue"
+                try {
+                    & taskkill /PID $proc.Id /T /F *> $null
+                    if ($LASTEXITCODE -ne 0) {
+                        Write-Host ("    Could not terminate the wedged CLI process tree (pid " +
+                            "$($proc.Id), taskkill exit $LASTEXITCODE) - it may keep running.") `
+                            -ForegroundColor Yellow
+                    }
+                } finally { $ErrorActionPreference = $prevEap }
+            }
+            else {
+                $proc.Kill()
+            }
+        }
+        catch {
+            Write-Host ("    Could not terminate the wedged CLI process tree (pid $($proc.Id)): " +
+                "$($_.Exception.Message)") -ForegroundColor Yellow
+        }
+        try { [void]$proc.WaitForExit(3000) } catch { }
+        return $null
+    }
+    return ($proc.ExitCode -eq 0)
+}
+
+function Invoke-Compose([string[]]$ComposeArgs, [string]$FailureHint) {
+    Write-Host "    Running: docker compose $($ComposeArgs -join ' ')" -ForegroundColor DarkGray
+    & docker compose @ComposeArgs
+    if ($LASTEXITCODE -ne 0) {
+        Fail "$FailureHint (docker compose $($ComposeArgs -join ' ') exited with code $LASTEXITCODE)"
+    }
+}
+
+function Test-CompilationErrors([string]$RepoRoot) {
+    # Pre-flight TypeScript check to fail fast before Docker build
+    $frontendPath = Join-Path $RepoRoot "frontend"
+    if (-not (Test-Path $frontendPath)) { return $true }
+    
+    Push-Location $frontendPath
+    try {
+        Write-Progress-Inline "Checking TypeScript compilation..."
+        $prev = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        $output = pnpm run type-check 2>&1
+        $ok = $LASTEXITCODE -eq 0
+        $ErrorActionPreference = $prev
+        
+        if ($ok) {
+            Write-Progress-Done "TypeScript check passed"
+            return $true
+        } else {
+            Write-Host ""
+            Write-Host "TypeScript compilation errors detected:" -ForegroundColor Red
+            Write-Host $output -ForegroundColor Yellow
+            return $false
+        }
+    } finally {
+        Pop-Location
+    }
+}
+
+function Invoke-WithRetry([scriptblock]$Block, [string]$What, [int]$MaxAttempts = 3, [int]$DelaySeconds = 6) {
+    # Run a native/docker command up to $MaxAttempts times, treating a
+    # non-zero exit as retryable. Transient registry/DNS/proxy hiccups
+    # (ghcr.io token fetch, base-image metadata pulls) are the single most
+    # common install failure on real machines; a couple of retries clears
+    # nearly all of them without any user action.
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        $prev = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        
+        # Check if this is a compilation error (not retryable)
+        $output = & $Block 2>&1
+        $isCompilationError = $output -match "error TS\d+" -or $output -match "ELIFECYCLE"
+        
+        $ErrorActionPreference = $prev
+        
+        if ($LASTEXITCODE -eq 0) { 
+            return $true 
+        }
+        
+        if ($isCompilationError) {
+            Write-Host ""
+            Write-Host "Compilation error detected (not retryable):" -ForegroundColor Red
+            Write-Host $output -ForegroundColor Yellow
+            return $false
+        }
+        
+        if ($attempt -lt $MaxAttempts) {
+            Write-Host "  $What failed (attempt $attempt of $MaxAttempts) - retrying in $DelaySeconds`s..." -ForegroundColor Yellow
+            Start-Sleep -Seconds $DelaySeconds
+            $DelaySeconds = [Math]::Min($DelaySeconds * 2, 30)
+        }
+    }
+    return $false
+}
+
+function Get-BuildBaseImages([string]$RepoRoot) {
+    # Parse every backend/Dockerfile.* for the external images its build
+    # depends on: `FROM <ref>` bases and `COPY --from=<ref>` stages. Named
+    # local build stages (FROM ... AS <name>, and COPY --from=<name>) are
+    # excluded - only real registry references are returned.
+    $images = [System.Collections.Generic.List[string]]::new()
+    $dockerfiles = Get-ChildItem -Path (Join-Path $RepoRoot "backend") -Filter "Dockerfile.*" -File -ErrorAction SilentlyContinue
+    foreach ($df in $dockerfiles) {
+        $lines = Get-Content $df.FullName
+        $stages = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        # First pass: collect local stage aliases (FROM ... AS <alias>).
+        foreach ($line in $lines) {
+            if ($line -match "^\s*FROM\s+(?:--\S+\s+)*\S+\s+AS\s+(\S+)") {
+                [void]$stages.Add($Matches[1])
+            }
+        }
+        # Second pass: collect external refs that are not local stages.
+        foreach ($line in $lines) {
+            if ($line -match "^\s*FROM\s+(?:--\S+\s+)*(\S+)") {
+                $ref = $Matches[1]
+                if (-not $stages.Contains($ref) -and -not $images.Contains($ref)) { $images.Add($ref) }
+            }
+            if ($line -match "--from=(\S+)") {
+                $ref = $Matches[1]
+                # Only registry-shaped refs (a stage name has no ':' or '/').
+                if (($ref -match "[:/]") -and -not $stages.Contains($ref) -and -not $images.Contains($ref)) {
+                    $images.Add($ref)
+                }
+            }
+        }
+    }
+    return $images.ToArray()
+}
+
+function Get-ComposeRemoteImages([string[]]$Profiles = @()) {
+    # Images that docker-compose PULLS (services with an `image:` and no
+    # `build:`) - db, redis, and (with the profile) ollama. Built services
+    # are excluded so we never try to `docker pull wardress-app`. Derived
+    # from `docker compose config`, so it always matches the compose file.
+    $profileArgs = @()
+    foreach ($p in $Profiles) { $profileArgs += @("--profile", $p) }
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    $json = & docker compose @profileArgs config --format json 2>$null
+    $ok = ($LASTEXITCODE -eq 0)
+    $ErrorActionPreference = $prev
+    if (-not $ok -or -not $json) { return @() }
+    try { $cfg = $json | ConvertFrom-Json } catch { return @() }
+    $images = [System.Collections.Generic.List[string]]::new()
+    if ($cfg.PSObject.Properties.Name -contains "services") {
+        foreach ($svc in $cfg.services.PSObject.Properties) {
+            $v = $svc.Value
+            $hasImage = ($v.PSObject.Properties.Name -contains "image") -and $v.image
+            $hasBuild = ($v.PSObject.Properties.Name -contains "build") -and $v.build
+            if ($hasImage -and -not $hasBuild) {
+                if (-not $images.Contains($v.image)) { $images.Add($v.image) }
+            }
+        }
+    }
+    return $images.ToArray()
+}
+
+function Get-ComposeServiceImage([string]$Service) {
+    # The resolved image ref for one service (used to reuse an already-present
+    # image as a throwaway tar helper instead of pulling a new one).
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    $json = & docker compose config --format json 2>$null
+    $ok = ($LASTEXITCODE -eq 0)
+    $ErrorActionPreference = $prev
+    if (-not $ok -or -not $json) { return $null }
+    try { $cfg = $json | ConvertFrom-Json } catch { return $null }
+    if ($cfg.PSObject.Properties.Name -contains "services") {
+        $svc = $cfg.services.PSObject.Properties | Where-Object { $_.Name -eq $Service } | Select-Object -First 1
+        if ($svc -and ($svc.Value.PSObject.Properties.Name -contains "image")) { return $svc.Value.image }
+    }
+    return $null
+}
+
+function Warm-Images([string[]]$Images) {
+    # Best-effort: pull each image with retries so a transient registry
+    # error warms the cache instead of aborting a multi-minute build.
+    $total = $Images.Length
+    $current = 0
+    
+    foreach ($img in $Images) {
+        if (-not $img) { continue }
+        $current++
+        
+        Write-Progress-Inline "Pulling base image $current/$total`: $img"
+        $ok = Invoke-WithRetry { docker pull $img *>&1 | Out-Null } "Pulling $img" 2
+        
+        if ($ok) {
+            Write-Host "    [$current/$total] Pulled: $img" -ForegroundColor Green
+        } else {
+            Write-Host "    [$current/$total] Failed: $img (will retry during build)" -ForegroundColor Yellow
+        }
+    }
+    
+    if ($total -gt 0) {
+        Write-Progress-Done "Pulled $current/$total base images"
+    }
+}
+
+function Build-Service([string[]]$BuildArgs, [string]$Service, [string]$FailureHint, [string]$LogDirectory) {
+    # Build logs go to a dedicated directory (never the repo root): on
+    # failure both files are KEPT there for diagnosis; on success they are
+    # removed again. $LogDirectory is passed by each entry-point script
+    # (anchored at its own $RepoRoot), so the paths never depend on whatever
+    # directory the user happened to invoke from.
+    if ([string]::IsNullOrEmpty($LogDirectory)) {
+        Fail "Internal error: Build-Service requires -LogDirectory (no repo-root log litter, by design)."
+    }
+    if (-not (Test-Path $LogDirectory)) {
+        try {
+            New-Item -ItemType Directory -Path $LogDirectory -Force | Out-Null
+        }
+        catch {
+            # A read-only checkout must still build: fall back to a per-user
+            # temp dir so the logs always have somewhere to land. If even
+            # that fails, let the throw surface - failing loud beats a
+            # silent unredirected build.
+            $LogDirectory = Join-Path ([System.IO.Path]::GetTempPath()) "wardress-build-logs"
+            New-Item -ItemType Directory -Path $LogDirectory -Force | Out-Null
+        }
+    }
+    $stdoutLog = Join-Path $LogDirectory "build_$Service.log"
+    $stderrLog = Join-Path $LogDirectory "build_$Service.err.log"
+
+    Write-Host "    Building $Service..." -ForegroundColor Cyan
+
+    # Stream build output with progress indicators
+    $buildCmd = "docker"
+    $fullArgs = @("compose", "build") + $BuildArgs + @($Service)
+
+    $startTime = Get-Date
+    $process = Start-Process -FilePath $buildCmd -ArgumentList $fullArgs `
+        -NoNewWindow -PassThru -RedirectStandardOutput $stdoutLog `
+        -RedirectStandardError $stderrLog
+    
+    # Cache the process handle immediately; otherwise, ExitCode returns $null after process termination.
+    $null = $process.Handle
+    
+    $spinChars = @('|', '/', '-', '\')
+    $spinIndex = 0
+    
+    while (-not $process.HasExited) {
+        $elapsed = [int]((Get-Date) - $startTime).TotalSeconds
+        $spin = $spinChars[$spinIndex % 4]
+        Write-Host "`r    Building $Service... $spin ($elapsed`s elapsed)" -NoNewline -ForegroundColor Cyan
+        $spinIndex++
+        Start-Sleep -Milliseconds 250
+    }
+    
+    $elapsed = [int]((Get-Date) - $startTime).TotalSeconds
+    Write-Host "`r" -NoNewline
+    
+    if ($process.ExitCode -eq 0) {
+        Write-Host "    Built $Service successfully ($elapsed`s)" -ForegroundColor Green
+        Remove-Item $stdoutLog -ErrorAction SilentlyContinue
+        Remove-Item $stderrLog -ErrorAction SilentlyContinue
+        # Best-effort: drop the log directory too when this run left it
+        # empty (a non-empty directory simply errors and stays).
+        Remove-Item $LogDirectory -ErrorAction SilentlyContinue
+        return $true
+    } else {
+        Write-Host "    Build failed for $Service" -ForegroundColor Red
+
+        # Show error details (docker writes build errors to stderr).
+        if (Test-Path $stderrLog) {
+            $errorContent = Get-Content $stderrLog -Raw
+            if ($errorContent) {
+                Write-Host ""
+                Write-Host "Build error output:" -ForegroundColor Red
+                Write-Host $errorContent -ForegroundColor Yellow
+            }
+        }
+
+        Fail ("$FailureHint. Build took $elapsed`s. Check build_$Service.err.log " +
+            "(full stdout: build_$Service.log) in $LogDirectory for details.")
+    }
+}

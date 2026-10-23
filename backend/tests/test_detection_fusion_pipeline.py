@@ -1,0 +1,575 @@
+"""Detection layers 6-9 + pipeline unit tests: security metadata,
+cloaking, semantics (lexicon parts — embeddings mocked to None here for
+hermeticity; test_end_to_end_flagging.py exercises the drift path with
+real vector-valued stubs), fusion, and gating."""
+
+import json
+
+import pytest
+
+from worker.detection import pipeline as pipeline_mod
+from worker.detection.cloaking import layer7_cloaking
+from worker.detection.fusion import (
+    FEATURE_KEYS,
+    MODEL_ARTIFACT_PATH,
+    build_feature_vector,
+    get_fusion_model,
+    layer9_fusion,
+)
+from worker.detection.metadata import layer6_security_metadata
+from worker.detection.pipeline import run_detection
+from worker.detection.semantics import layer8_semantics
+from worker.detection.types import PageData, ScanPageData, UAVariant
+from worker.hashing import content_sha256
+
+HTML = "<html><body><h1>Acme</h1><p>Reliable widgets.</p></body></html>"
+
+
+def page(html: str = HTML, **kwargs) -> PageData:
+    defaults = {"final_url": "https://acme.com/", "content_hash": content_sha256(html)}
+    defaults.update(kwargs)
+    return PageData(html=html, **defaults)
+
+
+def scan_page(html: str = HTML, **kwargs) -> ScanPageData:
+    defaults = {"final_url": "https://acme.com/", "content_hash": content_sha256(html)}
+    defaults.update(kwargs)
+    return ScanPageData(html=html, **defaults)
+
+
+def _score(result: dict) -> float:
+    assert 0.0 <= result["score"] <= 1.0
+    assert isinstance(result["evidence"], dict)
+    return result["score"]
+
+
+TLS_A = {
+    "fingerprint_sha256": "a" * 64,
+    "not_after": "2027-01-01T00:00:00+00:00",
+    "expired": False,
+    "subject": "CN=acme.com",
+    "issuer": "CN=Let's Encrypt R11,O=Let's Encrypt,C=US",
+}
+HEADERS_SECURE = {
+    "content-security-policy": "default-src 'self'",
+    "strict-transport-security": "max-age=63072000",
+    "x-frame-options": "DENY",
+    "content-type": "text/html",
+}
+
+
+# --- layer 6: security metadata ---
+
+
+def test_layer6_no_changes() -> None:
+    b = page(tls=dict(TLS_A), headers=dict(HEADERS_SECURE), robots_txt="User-agent: *")
+    c = page(tls=dict(TLS_A), headers=dict(HEADERS_SECURE), robots_txt="User-agent: *")
+    assert _score(layer6_security_metadata(b, c)) == 0.0
+
+
+def test_layer6_no_metadata_at_all() -> None:
+    # Phase 24: a probe that captured nothing comparable is a degraded
+    # measurement, not a trusted zero (https final URLs mean absent TLS
+    # data cannot be explained away as a plain-HTTP site).
+    result = layer6_security_metadata(page(), page())
+    assert result["score"] is None
+    assert result["skipped"] is True
+    assert result["degraded"] is True
+
+
+def test_layer6_cert_reissue_same_issuer_scores_low() -> None:
+    new_tls = dict(TLS_A, fingerprint_sha256="b" * 64)
+    result = layer6_security_metadata(page(tls=dict(TLS_A)), page(tls=new_tls))
+    assert 0.0 < _score(result) <= 0.2
+    assert result["evidence"]["tls"]["fingerprint_changed"] is True
+
+
+def test_layer6_cert_issuer_change_scores_higher() -> None:
+    new_tls = dict(TLS_A, fingerprint_sha256="b" * 64, issuer="CN=Sketchy CA,C=XX")
+    result = layer6_security_metadata(page(tls=dict(TLS_A)), page(tls=new_tls))
+    assert _score(result) >= 0.5
+    assert result["evidence"]["tls"]["issuer_changed"] is True
+
+
+def test_layer6_expired_cert_flagged() -> None:
+    new_tls = dict(TLS_A, expired=True)
+    result = layer6_security_metadata(page(tls=dict(TLS_A)), page(tls=new_tls))
+    assert _score(result) >= 0.5
+    assert result["evidence"]["tls"]["expired"] is True
+
+
+def test_layer6_security_header_removed() -> None:
+    weakened = {k: v for k, v in HEADERS_SECURE.items() if k != "content-security-policy"}
+    result = layer6_security_metadata(page(headers=HEADERS_SECURE), page(headers=weakened))
+    assert _score(result) >= 0.3
+    assert result["evidence"]["headers"]["security_headers_removed"] == ["content-security-policy"]
+
+
+def test_layer6_header_added_is_not_a_threat() -> None:
+    more = dict(HEADERS_SECURE, **{"referrer-policy": "no-referrer"})
+    result = layer6_security_metadata(page(headers=HEADERS_SECURE), page(headers=more))
+    assert _score(result) == 0.0
+    assert "referrer-policy" in result["evidence"]["headers"]["security_headers_added"]
+
+
+def test_layer6_robots_txt_changed() -> None:
+    result = layer6_security_metadata(
+        page(robots_txt="User-agent: *\nDisallow:"),
+        page(robots_txt="User-agent: *\nDisallow: /\n# pwned"),
+    )
+    assert _score(result) > 0.0
+    assert result["evidence"]["robots_txt"]["changed"] is True
+
+
+def test_layer6_degraded_header_probe_not_a_downgrade() -> None:
+    """A scan whose header probe failed (empty map) must not report every
+    baseline security header as removed. The TLS channel is healthy here,
+    so the layer still measures what it can; a FULLY dark probe degrades
+    the whole layer instead (test_phase24_degradation_signaling.py)."""
+    result = layer6_security_metadata(
+        page(tls=dict(TLS_A), headers=HEADERS_SECURE),
+        page(tls=dict(TLS_A), headers={}),
+    )
+    assert result["evidence"]["headers"].get("security_headers_removed") is None
+    assert "note" in result["evidence"]["headers"]
+    assert _score(result) == 0.0
+
+
+def test_layer6_tls_data_lost_scores_moderate() -> None:
+    result = layer6_security_metadata(page(tls=dict(TLS_A)), page(tls=None))
+    assert 0.4 <= _score(result) <= 0.8
+
+
+# --- layer 7: cloaking ---
+
+
+def _variant(ua_key: str, html: str, status: int = 200, **kwargs) -> UAVariant:
+    return UAVariant(
+        ua_key=ua_key,
+        html=html,
+        http_status=status,
+        content_hash=content_sha256(html) if html else "",
+        **kwargs,
+    )
+
+
+def test_layer7_consistent_across_uas() -> None:
+    current = scan_page(
+        ua_variants=[
+            _variant("desktop_chrome", HTML),
+            _variant("googlebot", HTML),
+            _variant("mobile_safari", HTML),
+        ]
+    )
+    result = layer7_cloaking(page(), current)
+    assert _score(result) == 0.0
+    comparable = [v for v in result["evidence"]["variants"] if v["comparable"]]
+    assert all(v.get("similarity") == 1.0 for v in comparable)
+
+
+RICH_HTML = (
+    "<html><body><h1>Acme Industrial Supply</h1>"
+    "<p>Reliable widgets delivered since 1970 with warranty.</p>"
+    "<p>Our catalog covers fasteners bearings seals pumps valves hoses fittings couplings "
+    "and every industrial spare part your maintenance team orders weekly.</p>"
+    "<p>Contact sales support shipping returns careers partners news events today.</p>"
+    "</body></html>"
+)
+
+
+def test_layer7_cloaked_googlebot_detected() -> None:
+    """An entirely different page served to googlebot scores high. The
+    fixture is a realistically-sized page (Phase 21 note: token-set counts
+    below the churn-grace floor cannot express 'different site' — a former
+    3-visible-token fixture correctly measures 0.0 under the graded model,
+    see test_phase21_cloaking_grade.py's grace guards)."""
+    spam = (
+        "<html><body><h1>Cheap pills casino</h1>"
+        "<p>spam spam links casino pills pharmacy winners loans</p></body></html>"
+    )
+    current = scan_page(
+        ua_variants=[
+            _variant("desktop_chrome", RICH_HTML),
+            _variant("googlebot", spam),
+            _variant("mobile_safari", RICH_HTML),
+        ]
+    )
+    result = layer7_cloaking(page(RICH_HTML), current)
+    assert _score(result) >= 0.7
+
+
+def test_layer7_bot_blocking_is_not_cloaking() -> None:
+    current = scan_page(
+        ua_variants=[
+            _variant("desktop_chrome", HTML),
+            _variant("googlebot", "<html><body>403 Forbidden</body></html>", status=403),
+            _variant("mobile_safari", HTML),
+        ]
+    )
+    assert _score(layer7_cloaking(page(), current)) == 0.0
+
+
+def test_layer7_variant_fetch_error_degrades() -> None:
+    """One failed crawler fetch beside a healthy reference: the target
+    refused/failed, which is an observation (not cloaking), not a broken
+    probe — the layer still measures and scores 0.0."""
+    current = scan_page(
+        ua_variants=[
+            _variant("desktop_chrome", HTML),
+            UAVariant(ua_key="googlebot", error="ConnectTimeout: ..."),
+        ]
+    )
+    result = layer7_cloaking(page(), current)
+    assert _score(result) == 0.0
+    assert not result.get("degraded")
+
+
+def test_layer7_no_variants_at_all() -> None:
+    # Phase 24: no rotation fetches at all = probe-side degradation, not a
+    # measured "no divergence".
+    result = layer7_cloaking(page(), scan_page())
+    assert result["score"] is None
+    assert result["skipped"] is True
+    assert result["degraded"] is True
+    assert "probe degraded" in result["evidence"]["reason"]
+
+
+def test_layer7_unusable_reference_degrades() -> None:
+    current = scan_page(
+        ua_variants=[
+            _variant("desktop_chrome", "", status=500),
+            _variant("googlebot", HTML),
+        ]
+    )
+    result = layer7_cloaking(page(), current)
+    assert result["score"] is None
+    assert result["skipped"] is True
+    assert result["degraded"] is True
+    assert "reference" in result["evidence"]["reason"]
+
+
+def test_layer7_mild_dynamic_variation_below_knee() -> None:
+    slightly_different = HTML.replace("Reliable widgets.", "Reliable widgets. Visitor #42")
+    current = scan_page(
+        ua_variants=[
+            _variant("desktop_chrome", HTML),
+            _variant("googlebot", slightly_different),
+        ]
+    )
+    assert _score(layer7_cloaking(page(), current)) == 0.0
+
+
+# --- layer 8: semantics (lexicon paths; embeddings mocked) ---
+
+
+@pytest.fixture(autouse=True)
+def no_network_embeddings(monkeypatch: pytest.MonkeyPatch):
+    """Unit tests never download MiniLM: embed_text -> None (the layer's
+    documented degraded mode). The live-stack check covers real inference."""
+    from worker.detection import semantics
+
+    monkeypatch.setattr(semantics, "embed_text", lambda text: None)
+
+
+def test_layer8_clean_rescan_scores_zero() -> None:
+    assert _score(layer8_semantics(page(), page())) == 0.0
+
+
+def test_layer8_aggression_lexicon() -> None:
+    angry = HTML.replace(
+        "<p>Reliable widgets.</p>",
+        "<p>You will pay the price. We will be back. No one is safe.</p>",
+    )
+    result = layer8_semantics(page(), page(angry))
+    assert _score(result) >= 0.6
+    assert result["evidence"]["aggression_hits"]
+
+
+def test_layer8_topic_keywords() -> None:
+    braggy = HTML.replace(
+        "<p>Reliable widgets.</p>",
+        "<p>Your database dumped and leaked data on t.me/xyz — total breach.</p>",
+    )
+    result = layer8_semantics(page(), page(braggy))
+    assert _score(result) >= 0.35
+    assert "breach_bragging" in result["evidence"]["topic_hits"]
+
+
+def test_layer8_embeddings_unavailable_degrades() -> None:
+    result = layer8_semantics(page(), page(HTML.replace("Acme", "Bcme")))
+    assert result["evidence"]["semantic_similarity"] is None  # degraded, not crashed
+    assert 0.0 <= result["score"] <= 1.0
+
+
+def test_layer8_baseline_text_never_flags() -> None:
+    threat_blog = HTML.replace(
+        "<p>Reliable widgets.</p>", "<p>Analysis: attackers said 'no one is safe'.</p>"
+    )
+    assert _score(layer8_semantics(page(threat_blog), page(threat_blog))) == 0.0
+
+
+# --- layer 9: fusion ---
+
+
+def _results_from_scores(scores: dict[str, float | None]) -> dict[str, dict]:
+    out = {}
+    for key in FEATURE_KEYS:
+        s = scores.get(key)
+        if s is None:
+            out[key] = {"score": None, "skipped": True, "evidence": {"reason": "gated"}}
+        else:
+            out[key] = {"score": s, "evidence": {}}
+    return out
+
+
+def test_fusion_model_matches_committed_artifact() -> None:
+    """Determinism of the FIT, not just Python memoization (audit Phase 11:
+    the former ``assert m1 is m2`` asserted cache identity — it passed even
+    if the fit were random per process). The deployed model is the committed
+    artifact; the runtime must load it exactly, and its coefficients must
+    satisfy the structural finding-5.1 constraint (no negative attack-
+    evidence weights), so a corrupted artifact or a regression to an
+    unconstrained refit cannot ship silently."""
+    committed = json.loads(MODEL_ARTIFACT_PATH.read_text(encoding="utf-8"))
+    model = get_fusion_model()
+
+    assert model.coefficients == tuple(float(c) for c in committed["model"]["coefficients"])
+    assert model.intercept == float(committed["model"]["intercept"])
+    assert all(c >= 0.0 for c in model.coefficients)
+    assert model.lambda_selected == committed["meta"]["fit"]["lambda_selected"]
+    assert model.dataset_sha256 == committed["meta"]["dataset"]["sha256"]
+
+    # Cache behavior, stated as exactly what it is: repeated calls reuse the
+    # same loaded object (identity), which follows from loading the identical
+    # bytes — not a substitute for the value equality above.
+    assert get_fusion_model() is model
+
+
+def test_fusion_all_clean_scores_low() -> None:
+    result = layer9_fusion(_results_from_scores(dict.fromkeys(FEATURE_KEYS, 0.0)))
+    assert result["score"] < 0.2
+
+
+def test_fusion_full_defacement_scores_high() -> None:
+    result = layer9_fusion(
+        _results_from_scores(
+            {
+                "layer1_hash": 1.0,
+                "layer2_dom_structure": 0.9,
+                "layer3_link_audit": 0.8,
+                "layer4_visual_diff": 0.85,
+                "layer5_signatures": 1.0,
+                "layer6_security_metadata": 0.5,
+                "layer7_cloaking": 0.0,
+                "layer8_semantics": 0.9,
+            }
+        )
+    )
+    assert result["score"] > 0.8
+
+
+def test_fusion_dynamic_noise_scores_low() -> None:
+    result = layer9_fusion(
+        _results_from_scores(
+            {
+                "layer1_hash": 1.0,
+                "layer2_dom_structure": 0.05,
+                "layer3_link_audit": 0.0,
+                "layer4_visual_diff": 0.03,
+                "layer5_signatures": 0.0,
+                "layer6_security_metadata": 0.0,
+                "layer7_cloaking": 0.0,
+                "layer8_semantics": 0.0,
+            }
+        )
+    )
+    assert result["score"] < 0.35
+
+
+def test_fusion_signature_hit_dominates() -> None:
+    result = layer9_fusion(
+        _results_from_scores(
+            {
+                "layer1_hash": 1.0,
+                "layer2_dom_structure": 0.2,
+                "layer3_link_audit": 0.1,
+                "layer4_visual_diff": 0.25,
+                "layer5_signatures": 1.0,
+                "layer6_security_metadata": 0.0,
+                "layer7_cloaking": 0.0,
+                "layer8_semantics": 0.55,
+            }
+        )
+    )
+    assert result["score"] > 0.6
+
+
+def test_fusion_cloaking_alone_flags() -> None:
+    scores = dict.fromkeys(FEATURE_KEYS, 0.0)
+    scores["layer7_cloaking"] = 0.95
+    result = layer9_fusion(_results_from_scores(scores))
+    assert result["score"] > 0.5
+
+
+def test_fusion_skipped_layers_masked() -> None:
+    results = _results_from_scores(
+        {
+            "layer1_hash": 0.0,
+            "layer2_dom_structure": None,
+            "layer3_link_audit": None,
+            "layer4_visual_diff": None,
+            "layer5_signatures": None,
+            "layer6_security_metadata": 0.0,
+            "layer7_cloaking": 0.0,
+            "layer8_semantics": None,
+        }
+    )
+    vector, ran = build_feature_vector(results)
+    assert vector == [0.0] * 8
+    assert ran["layer2_dom_structure"] is False
+    assert layer9_fusion(results)["score"] < 0.2
+
+
+def test_fusion_never_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    from worker.detection import fusion
+
+    def broken_model():
+        raise RuntimeError("model exploded")
+
+    monkeypatch.setattr(fusion, "get_fusion_model", broken_model)
+    scores = dict.fromkeys(FEATURE_KEYS, 0.0)
+    scores["layer5_signatures"] = 0.9
+    result = fusion.layer9_fusion(_results_from_scores(scores))
+    assert result["score"] == 0.9  # fallback: max sub-score
+    assert "fallback" in result["evidence"]["model"]
+
+
+def test_layer_result_clamps_nan_to_zero() -> None:
+    """A NaN score is a numeric fault, not a max-severity signal: it must
+    coerce to 0.0 (not 1.0) and record the fault in evidence, so a bug in
+    one layer can't manufacture a top-severity alarm with no trail."""
+    from worker.detection.types import layer_result
+
+    out = layer_result(float("nan"), {"note": "computed"})
+    assert out["score"] == 0.0
+    assert "non-finite" in out["evidence"]["score_fault"]
+    assert out["evidence"]["note"] == "computed"  # original evidence preserved
+
+    inf_out = layer_result(float("inf"), {})
+    assert inf_out["score"] == 0.0
+    assert "non-finite" in inf_out["evidence"]["score_fault"]
+
+
+def test_fusion_survives_malformed_layer_score() -> None:
+    """A present-but-non-numeric layer score must not raise out of the
+    fusion vector build (which used to run before the fallback try). It is
+    coerced to 0.0 and the layer still produces a score."""
+    results = _results_from_scores(dict.fromkeys(FEATURE_KEYS, 0.0))
+    # A layer that returned a bad score dict (e.g. a string leaked through).
+    results["layer4_visual_diff"] = {"score": "not-a-number", "evidence": {}}
+    vector, ran = build_feature_vector(results)
+    assert vector[FEATURE_KEYS.index("layer4_visual_diff")] == 0.0
+    out = layer9_fusion(results)
+    assert 0.0 <= out["score"] <= 1.0
+
+
+def test_fusion_survives_nan_layer_score() -> None:
+    results = _results_from_scores(dict.fromkeys(FEATURE_KEYS, 0.0))
+    results["layer2_dom_structure"] = {"score": float("nan"), "evidence": {}}
+    vector, _ = build_feature_vector(results)
+    assert vector[FEATURE_KEYS.index("layer2_dom_structure")] == 0.0
+    out = layer9_fusion(results)
+    assert 0.0 <= out["score"] <= 1.0
+
+
+# --- pipeline gating ---
+
+
+def test_pipeline_identical_hash_gates_content_layers() -> None:
+    results = run_detection(page(), scan_page())
+    assert results["layer1_hash"]["score"] == 0.0
+    for gated in (
+        "layer2_dom_structure",
+        "layer3_link_audit",
+        "layer5_signatures",
+        "layer8_semantics",
+    ):
+        assert results[gated]["skipped"] is True
+        assert "gated by layer 1" in results[gated]["evidence"]["reason"]
+        # A hash-gate skip is a PROOF of zero, not a degradation.
+        assert not results[gated].get("degraded")
+    # The visual layer runs even on an identical hash: the serialized DOM
+    # says nothing about externally-referenced assets or pixels (see
+    # test_pipeline_visual_gate.py). No screenshots here -> degraded
+    # (capture-side failure), never a silent measured-zero.
+    visual = results["layer4_visual_diff"]
+    assert visual["skipped"] is True
+    assert visual["degraded"] is True
+    assert "screenshot missing or unreadable" in visual["evidence"]["reason"]
+    # Metadata + cloaking: these bare fixtures carry no probe data, so the
+    # channels are dark too — degraded, not trusted zeros.
+    for key in ("layer6_security_metadata", "layer7_cloaking"):
+        assert results[key]["degraded"] is True
+        assert results[key]["score"] is None
+    assert results["layer9_fusion"]["score"] is not None
+
+
+def _png_bytes(color=(250, 250, 250)) -> bytes:
+    import io
+
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.new("RGB", (64, 48), color).save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def test_pipeline_changed_hash_runs_all_layers() -> None:
+    changed = HTML.replace("Acme", "HACKED BY XYZ")
+    shot = _png_bytes()
+    healthy = dict(
+        tls=dict(TLS_A),
+        headers=dict(HEADERS_SECURE),
+        robots_txt="User-agent: *",
+        screenshot=shot,
+    )
+    variants = [
+        UAVariant(
+            ua_key="desktop_chrome", html=HTML, http_status=200, content_hash=content_sha256(HTML)
+        ),
+        UAVariant(
+            ua_key="googlebot", html=HTML, http_status=200, content_hash=content_sha256(HTML)
+        ),
+        UAVariant(
+            ua_key="mobile_safari", html=HTML, http_status=200, content_hash=content_sha256(HTML)
+        ),
+    ]
+    results = run_detection(page(**healthy), scan_page(changed, ua_variants=variants, **healthy))
+    for _, key in pipeline_mod.LAYERS:
+        assert key in results
+        if key != "layer9_fusion":
+            assert not results[key].get("skipped"), key
+
+
+def test_pipeline_layer_crash_is_isolated(monkeypatch: pytest.MonkeyPatch) -> None:
+    def exploding(baseline, current):
+        raise RuntimeError("parser exploded")
+
+    monkeypatch.setitem(pipeline_mod._LAYER_FUNCS, "layer5_signatures", exploding)
+    results = run_detection(page(), scan_page(HTML.replace("Acme", "Other")))
+    assert results["layer5_signatures"]["skipped"] is True
+    assert "RuntimeError" in results["layer5_signatures"]["evidence"]["error"]
+    # Everything else still produced results, and fusion still fused.
+    assert results["layer2_dom_structure"]["score"] is not None
+    assert results["layer9_fusion"]["score"] is not None
+
+
+def test_pipeline_missing_baseline_html_skips_content_layers() -> None:
+    baseline = page("")  # artifact lost; hash retained
+    baseline.content_hash = "0" * 64
+    results = run_detection(baseline, scan_page(HTML))
+    assert results["layer1_hash"]["score"] == 1.0
+    assert results["layer2_dom_structure"]["skipped"] is True
+    assert "artifact unavailable" in results["layer2_dom_structure"]["evidence"]["reason"]
+    # Visual diff can still run (screenshot artifact is independent).
+    assert "layer4_visual_diff" in results
